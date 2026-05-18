@@ -127,8 +127,9 @@ export interface FilterAttrData {
   componentTypeList: ProductTypeAgg[];
   productTypeList: ProductTypeAgg[];
   productTypeAggs: ProductTypeAgg[];
-  componentBrandList: string[];
-  componentSpecificationList: string[];
+  /** Despite the name, the API returns aggregation objects, not bare strings. */
+  componentBrandList: ParamAgg[];
+  componentSpecificationList: ParamAgg[];
   parentParamList?: ParamAgg[] | null;
   parentParamRangeList?: ParamAgg[] | null;
   paramList?: ParamAgg[] | null;

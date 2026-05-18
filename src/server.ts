@@ -233,7 +233,7 @@ function attrFiltersToList(filters: Record<string, string[]>): ComponentAttribut
 // ---------- MCP server ----------
 
 const server = new Server(
-  { name: "jlcpcb-mcp", version: "0.5.0" },
+  { name: "jlcpcb-mcp", version: "0.5.1" },
   { capabilities: { tools: {} } },
 );
 
@@ -358,8 +358,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         collected.sort((a, b) => (collectedSortKeys.get(b.name) ?? 0) - (collectedSortKeys.get(a.name) ?? 0));
 
-        const allMfrs = data.componentBrandList ?? [];
-        const allPkgs = data.componentSpecificationList ?? [];
+        // The API returns these as ProductTypeAgg objects, not bare strings — normalise to [name, count]
+        // tuples sorted by count desc (most-common first). Strip the "-" placeholder.
+        const aggToTuples = (xs: { name: string; docCount: number }[] | undefined | null): FacetTuple[] =>
+          (xs ?? [])
+            .filter((x) => x?.name && x.name !== "-" && x.docCount > 0)
+            .sort((a, b) => b.docCount - a.docCount)
+            .map((x) => [x.name, x.docCount] as FacetTuple);
+
+        const mfrTuples = aggToTuples(data.componentBrandList);
+        const pkgTuples = aggToTuples(data.componentSpecificationList);
 
         return {
           content: [
@@ -368,11 +376,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
               total: data.total,
               values_format: "[value, count]",
               manufacturers: input.include_manufacturers
-                ? { count: allMfrs.length, all: allMfrs }
-                : { count: allMfrs.length, sample: allMfrs.slice(0, 30) },
+                ? { count: mfrTuples.length, all: mfrTuples }
+                : { count: mfrTuples.length, sample: mfrTuples.slice(0, 30) },
               packages: input.include_packages
-                ? { count: allPkgs.length, all: allPkgs }
-                : { count: allPkgs.length, sample: allPkgs.slice(0, 30) },
+                ? { count: pkgTuples.length, all: pkgTuples }
+                : { count: pkgTuples.length, sample: pkgTuples.slice(0, 30) },
               attributes: collected,
             }),
           ],
