@@ -117,37 +117,29 @@ Behind the scenes, `search_parts` posts to JLCPCB's `selectSmtComponentList/v2` 
 
 ```jsonc
 {
-  "top_category": { "id": 5, "name": "Transistors/Thyristors" },
-  "subcategory":  { "id": 2954, "name": "MOSFETs", "count": 72110 },
-  "total_in_subcategory": 37093,
-  "always_available_filters": {
-    "in_stock_only": true,
-    "library_type": ["basic","extended"],
-    "sort_by": ["relevance","stock"],
-    "min_stock": "integer >= 0"
-  },
-  "manufacturers": [/* 216 entries */],
-  "packages":      [/* 1191 entries */],
+  "subcategory": { "id": 2954, "name": "MOSFETs", "parent": "Transistors/Thyristors" },
+  "total": 37093,
+  "values_format": "[value, count]",
+  "manufacturers": { "count": 216, "sample": ["Infineon Technologies", "Vishay Intertech", ...] },
+  "packages":      { "count": 1191, "sample": ["SOT-23", "DPAK", "TO-220", ...] },
   "attributes": [
     {
       "name": "Drain to Source Voltage",
+      "total_values": 103,
       "values": [
-        { "value": "30V", "count": 4892 },
-        { "value": "60V", "count": 2104 },
-        { "value": "600V", "count": 636 },
+        ["30V", 14210],
+        ["60V", 10030],
+        ["600V", 3066],
         ...
       ]
     },
-    { "name": "Type", "values": [
-        { "value": "N-Channel", "count": 28150 },
-        { "value": "P-Channel", "count": 8800 },
-        { "value": "N-Channel + P-Channel", "count": 143 }
-    ] },
-    { "name": "RDS(on)", "values": [...] },
-    ...
+    { "name": "Type", "total_values": 3, "values": [["N-Channel", 28150], ["P-Channel", 8800], ["N-Channel + P-Channel", 143]] },
+    { "name": "RDS(on)", "total_values": 1022, "values": [["5mΩ@10V", ...], ...] }
   ]
 }
 ```
+
+`values` are emitted as `[value, count]` tuples (sorted by count desc). Use `get_attribute_values` for the full list of a single attribute when `total_values` exceeds the per-attribute cap. Pass `include_manufacturers: true` / `include_packages: true` to get the full lists instead of the 30-entry sample.
 
 ### `search_parts({ ... })`
 
@@ -165,44 +157,44 @@ Behind the scenes, `search_parts` posts to JLCPCB's `selectSmtComponentList/v2` 
 | `sort_by` | `"relevance" \| "stock"` | `"relevance"` | `stock` uses the API's `sortMode: STOCK_SORT` / `sortASC: DESC`. |
 | `page` | int | `1` | 1-based. |
 | `page_size` | int | `20` | Max `50` (JLCPCB API ceiling). |
+| `verbose` | boolean | `false` | If true, response also includes an `applied` block echoing the filters. |
 
-Returns (abridged):
+Returns dense JSON (no whitespace, common fields hoisted, empty fields omitted):
 
 ```jsonc
 {
   "total": 636,
-  "page": 1, "page_size": 50, "pages": 13, "has_next": true,
-  "sort_by": "stock",
-  "applied": {
-    "subcategory_id": 2954,
-    "attribute_filters": { "Drain to Source Voltage": ["600V"], "Type": ["N-Channel"] },
-    "in_stock_only": true
-  },
+  "page": 1, "page_size": 50, "pages": 13,
+  "sort": "stock",
+  "context": { "top_category": "Transistors/Thyristors", "sub_category": "MOSFETs" },
   "items": [
     {
       "lcsc": "C2889158",
       "mpn": "2N60G",
-      "manufacturer": "...",
-      "top_category": "Transistors/Thyristors",
-      "sub_category": "MOSFETs",
-      "package": "SOT-223",
+      "mfr": "UMW(Youtai Semiconductor Co., Ltd.)",
+      "pkg": "SOT-223",
       "stock": 12625,
-      "library_type": "extended",
-      "price_breaks": [
-        { "qty_min": 1, "qty_max": 99, "unit_price_usd": 0.063 }, ...
-      ],
-      "datasheet_url": "...",
-      "image_url": "...",
-      "description": "...",
-      "attributes": { "Drain to Source Voltage": "600V", "Type": "N-Channel", ... }
+      "lib": "extended",
+      "prices_usd": { "1": 0.1037, "50": 0.0807, "150": 0.0691, "500": 0.0605, "2500": 0.0484, "5000": 0.0449 },
+      "datasheet": "https://...",
+      "image": "https://...",
+      "attrs": { "Drain to Source Voltage": "600V", "Type": "N-Channel", "RDS(on)": "4.2Ω@10V", ... }
     }
   ]
 }
 ```
 
+Field notes:
+- `prices_usd` is a `{qty_min: unit_price}` map. `qty_max` for each tier is implicit (next break − 1; the highest key has no upper bound).
+- `lib` is `basic` or `extended`.
+- `attrs` is a flat `{name: value}` map (placeholders like `-` are stripped).
+- Empty fields (`datasheet`, `image`) are omitted, not emitted as `null` / `""`.
+- `context` is hoisted out of each item — every item in the same page shares the same category, so it appears once at the envelope.
+- Pass `verbose: true` to also receive an `applied` block echoing the filters you sent.
+
 ### `get_part_details({ lcsc_code })`
 
-Same shape as a search item, plus `image_list` and `component_id`.
+Same dense item schema as `search_parts` items, plus `component_id`, `top_category`, `sub_category`, `description`.
 
 ### `refresh_category_cache({})`
 

@@ -123,6 +123,10 @@ const SearchInput = z.object({
   sort_by: SortByEnum.describe("'relevance' (JLCPCB default) or 'stock' (most-stocked first, sorted natively by the API)."),
   page: z.number().int().min(1).default(1),
   page_size: z.number().int().min(1).max(MAX_PAGE_SIZE).default(20),
+  verbose: z
+    .boolean()
+    .default(false)
+    .describe("If true, echo the applied filters in the response. Default false (saves tokens — you sent them, you already know)."),
 });
 
 const GetPartInput = z.object({
@@ -139,42 +143,81 @@ function mapLibraryType(v: z.infer<typeof LibraryTypeEnum>): { componentLibraryT
   return { componentLibTypes: [] };
 }
 
-function summarizeItem(it: ComponentItem) {
-  return {
-    lcsc: it.componentCode,
-    mpn: it.componentModelEn,
-    manufacturer: it.componentBrandEn,
-    top_category: it.secondSortName ?? null,
-    sub_category: it.firstSortName ?? it.componentTypeEn ?? null,
-    package: it.componentSpecificationEn,
-    stock: it.stockCount,
-    library_type:
-      it.componentLibraryType === "base" ? "basic" : it.componentLibraryType === "expand" ? "extended" : it.componentLibraryType,
-    price_breaks: (it.componentPrices ?? []).map((p) => ({
-      qty_min: p.startNumber,
-      qty_max: p.endNumber === -1 ? null : p.endNumber,
-      unit_price_usd: p.productPrice,
-    })),
-    datasheet_url: it.dataManualOfficialLink || it.dataManualUrl || null,
-    image_url: it.componentImageUrl ?? null,
-    description: it.describe ?? null,
-    attributes: (it.attributes ?? []).reduce<Record<string, string>>((acc, a) => {
-      if (a && a.attribute_name_en) acc[a.attribute_name_en] = a.attribute_value_name;
-      return acc;
-    }, {}),
-  };
+function shortLibType(s: string | undefined | null): "basic" | "extended" | null {
+  if (s === "base") return "basic";
+  if (s === "expand") return "extended";
+  return null;
 }
 
-function detailItem(it: ComponentItem) {
+/** Collapse price tiers to { "<qty_min>": price } — qty_max is implicit (next tier - 1, or unbounded for the last). */
+function compactPrices(tiers: ComponentItem["componentPrices"] | undefined | null): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const p of tiers ?? []) {
+    if (p?.startNumber != null && p?.productPrice != null) {
+      out[String(p.startNumber)] = p.productPrice;
+    }
+  }
+  return out;
+}
+
+/** Flatten the API's attributes array into a name→value map. Drops placeholders. */
+function compactAttrs(attrs: ComponentItem["attributes"] | undefined | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const a of attrs ?? []) {
+    const n = a?.attribute_name_en;
+    const v = a?.attribute_value_name;
+    if (!n || !v || v === "-" || v.includes("、-")) continue;
+    out[n] = v;
+  }
+  return out;
+}
+
+/** Dense per-item summary for search_parts. Drops nulls/empties; top/sub category hoisted to envelope. */
+function denseItem(it: ComponentItem): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    lcsc: it.componentCode,
+    mpn: it.componentModelEn,
+    mfr: it.componentBrandEn,
+    pkg: it.componentSpecificationEn,
+    stock: it.stockCount,
+  };
+  const lib = shortLibType(it.componentLibraryType as string);
+  if (lib) out.lib = lib;
+  const prices = compactPrices(it.componentPrices);
+  if (Object.keys(prices).length) out.prices_usd = prices;
+  const datasheet = it.dataManualOfficialLink || it.dataManualUrl || null;
+  if (datasheet) out.datasheet = datasheet;
+  const image = it.componentImageUrl || null;
+  if (image) out.image = image;
+  const attrs = compactAttrs(it.attributes);
+  if (Object.keys(attrs).length) out.attrs = attrs;
+  return out;
+}
+
+/** Full single-part record for get_part_details. Preserves more fields than denseItem. */
+function fullItem(it: ComponentItem): Record<string, unknown> {
   return {
-    ...summarizeItem(it),
-    image_list: it.imageList ?? [],
+    ...denseItem(it),
     component_id: it.componentId,
+    top_category: it.secondSortName ?? null,
+    sub_category: it.firstSortName ?? it.componentTypeEn ?? null,
+    description: it.describe || null,
   };
 }
 
 function flatNodes(nodes: ProductTypeAgg[] | null | undefined): { id: number; name: string; count: number }[] {
   return (nodes ?? []).map((n) => ({ id: Number(n.key), name: n.name, count: n.docCount }));
+}
+
+/** Compact tuple form for facet values: [value, count]. ~60% smaller than {value, count} objects. */
+type FacetTuple = [string, number];
+function toTuples(values: { value: string; count: number }[]): FacetTuple[] {
+  return values.map((v) => [v.value, v.count] as FacetTuple);
+}
+
+/** Serialise without indentation — saves ~30% bytes and tokens. */
+function jsonText(obj: unknown): { type: "text"; text: string } {
+  return { type: "text", text: JSON.stringify(obj) };
 }
 
 /** "Transistors/Thyristors" → "Transistors_Thyristors". JLCPCB uses this in firstSortNameNew. */
@@ -190,7 +233,7 @@ function attrFiltersToList(filters: Record<string, string[]>): ComponentAttribut
 // ---------- MCP server ----------
 
 const server = new Server(
-  { name: "jlcpcb-mcp", version: "0.4.0" },
+  { name: "jlcpcb-mcp", version: "0.5.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -210,25 +253,25 @@ const TOOLS = [
   {
     name: "list_filters_for_subcategory",
     description:
-      "Discover filters that apply to a sub-category: parametric attribute names with their MOST-COMMON values (capped, low-count noise stripped), plus counts. Stock filter is always available via in_stock_only. For full enumeration of one attribute's values, call get_attribute_values. The returned values can be passed verbatim to search_parts.attribute_filters.",
+      "Discover filters for a sub-category. Returns attributes[] where each has {name, total_values, values: [[value, count], ...]} — values are TUPLES, sorted by count desc, capped at values_per_attribute (default 20). For a single attribute's full value list, call get_attribute_values. Plus manufacturers {count, sample} and packages {count, sample}. Stock filter is always available via search_parts.in_stock_only.",
     inputSchema: zodToJsonSchema(ListFiltersInput),
   },
   {
     name: "get_attribute_values",
     description:
-      "Enumerate ALL distinct values (or the top-N most common) for ONE attribute within a sub-category. Use when list_filters_for_subcategory's per-attribute cap hid values you need.",
+      "Enumerate values for ONE attribute within a sub-category. Returns values: [[value, count], ...] as TUPLES, count desc. Use when list_filters_for_subcategory's per-attribute cap hid values you need.",
     inputSchema: zodToJsonSchema(GetAttributeValuesInput),
   },
   {
     name: "search_parts",
     description:
-      "Search JLCPCB parts. Pass subcategory_id for parametric filtering. attribute_filters takes { attribute_name: [values] } and is applied natively by the API. sort_by='stock' sorts natively. Pagination via page/page_size (max 50).",
+      "Search JLCPCB parts. attribute_filters: { name: [values] } — applied natively. sort_by='stock' sorts natively. Items are dense: {lcsc, mpn, mfr, pkg, stock, lib, prices_usd: {<qty_min>: price}, datasheet, image, attrs: {name: value}}. top_category/sub_category are HOISTED to result.context (not per-item). Pagination via page/page_size (max 50). Set verbose=true to echo applied filters.",
     inputSchema: zodToJsonSchema(SearchInput),
   },
   {
     name: "get_part_details",
     description:
-      "Get full details for one part by its LCSC C-code (e.g. 'C25804'). Includes price tiers, attributes, datasheet URL.",
+      "Full record for one part by LCSC C-code (e.g. 'C25804'). Same dense item schema as search_parts items, plus component_id, top_category, sub_category, description.",
     inputSchema: zodToJsonSchema(GetPartInput),
   },
   {
@@ -248,11 +291,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "list_top_categories": {
         const tree = await getCategoryTree();
         const cats = flatNodes(tree).sort((a, b) => a.name.localeCompare(b.name));
-        return {
-          content: [
-            { type: "text", text: JSON.stringify({ total_categories: cats.length, categories: cats }, null, 2) },
-          ],
-        };
+        return { content: [jsonText({ count: cats.length, categories: cats })] };
       }
 
       case "list_subcategories": {
@@ -268,7 +307,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const subs = flatNodes(top.subAggs).sort((a, b) => a.name.localeCompare(b.name));
         return {
           content: [
-            { type: "text", text: JSON.stringify({ top_category: { id: Number(top.key), name: top.name, count: top.docCount }, subcategories: subs }, null, 2) },
+            jsonText({
+              top_category: { id: Number(top.key), name: top.name, count: top.docCount },
+              subcategories: subs,
+            }),
           ],
         };
       }
@@ -294,7 +336,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         // MOSFET-type parametric facets land in `paramList`. parentParamList / parentParamRangeList
         // are used in other contexts (no subcategory). Merge all three, dedup by name.
         const seen = new Set<string>();
-        const collected: { name: string; total_values: number; total_parts: number; values: { value: string; count: number }[] }[] = [];
+        type Collected = { name: string; total_values: number; values: FacetTuple[] };
+        const collected: Collected[] = [];
+        let collectedSortKeys = new Map<string, number>(); // for sorting by total parts
         for (const src of [data.paramList ?? [], data.parentParamList ?? [], data.parentParamRangeList ?? []]) {
           for (const p of src) {
             if (!p?.name || seen.has(p.name)) continue;
@@ -303,55 +347,34 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
               .filter((v) => v.value && v.value !== "-" && !v.value.includes("、-"));
             if (!raw.length) continue;
             const above = raw.filter((v) => v.count >= input.min_value_count);
-            const useable = above.length ? above : raw; // if everything is rare, still show the rare ones
+            const useable = above.length ? above : raw;
             useable.sort((a, b) => b.count - a.count);
             const totalParts = useable.reduce((s, v) => s + v.count, 0);
             const capped = useable.slice(0, input.values_per_attribute);
             seen.add(p.name);
-            collected.push({ name: p.name, total_values: useable.length, total_parts: totalParts, values: capped });
+            collected.push({ name: p.name, total_values: useable.length, values: toTuples(capped) });
+            collectedSortKeys.set(p.name, totalParts);
           }
         }
-        // Most-useful attributes first (highest total parts covered).
-        collected.sort((a, b) => b.total_parts - a.total_parts);
+        collected.sort((a, b) => (collectedSortKeys.get(b.name) ?? 0) - (collectedSortKeys.get(a.name) ?? 0));
 
-        // Cap manufacturer/package lists too — they can have 200+/1000+ entries each.
         const allMfrs = data.componentBrandList ?? [];
         const allPkgs = data.componentSpecificationList ?? [];
 
         return {
           content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  top_category: { id: Number(ctx.top.key), name: ctx.top.name },
-                  subcategory: { id: Number(ctx.sub.key), name: ctx.sub.name, count: ctx.sub.docCount },
-                  total_in_subcategory: data.total,
-                  always_available_filters: {
-                    in_stock_only: true,
-                    library_type: ["basic", "extended"],
-                    sort_by: ["relevance", "stock"],
-                    min_stock: "integer >= 0",
-                  },
-                  hints: {
-                    values_per_attribute_cap: input.values_per_attribute,
-                    min_value_count: input.min_value_count,
-                    note: "Use get_attribute_values for an attribute's full value list. If 'total_values' on an attribute exceeds the cap, some values are hidden.",
-                  },
-                  manufacturers: {
-                    total: allMfrs.length,
-                    sample: input.include_manufacturers ? allMfrs : allMfrs.slice(0, 30),
-                  },
-                  packages: {
-                    total: allPkgs.length,
-                    sample: input.include_packages ? allPkgs : allPkgs.slice(0, 30),
-                  },
-                  attributes: collected,
-                },
-                null,
-                2,
-              ),
-            },
+            jsonText({
+              subcategory: { id: Number(ctx.sub.key), name: ctx.sub.name, parent: ctx.top.name },
+              total: data.total,
+              values_format: "[value, count]",
+              manufacturers: input.include_manufacturers
+                ? { count: allMfrs.length, all: allMfrs }
+                : { count: allMfrs.length, sample: allMfrs.slice(0, 30) },
+              packages: input.include_packages
+                ? { count: allPkgs.length, all: allPkgs }
+                : { count: allPkgs.length, sample: allPkgs.slice(0, 30) },
+              attributes: collected,
+            }),
           ],
         };
       }
@@ -394,24 +417,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           .filter((v) => v.value && v.value !== "-" && !v.value.includes("、-"));
         const filtered = raw.filter((v) => v.count >= input.min_value_count).sort((a, b) => b.count - a.count);
         const total_values = filtered.length;
-        const values = filtered.slice(0, input.limit);
+        const sliced = filtered.slice(0, input.limit);
         return {
           content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  subcategory: { id: Number(ctx.sub.key), name: ctx.sub.name },
-                  attribute: hit.name,
-                  total_values,
-                  returned: values.length,
-                  truncated: total_values > values.length,
-                  values,
-                },
-                null,
-                2,
-              ),
-            },
+            jsonText({
+              subcategory: { id: Number(ctx.sub.key), name: ctx.sub.name },
+              attribute: hit.name,
+              total_values,
+              truncated: total_values > sliced.length,
+              values_format: "[value, count]",
+              values: toTuples(sliced),
+            }),
           ],
         };
       }
@@ -474,15 +490,28 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const data = await client.search(body);
-        const items = (data.componentPageInfo.list ?? []).map(summarizeItem);
-        const result = {
+        const list = data.componentPageInfo.list ?? [];
+        const items = list.map(denseItem);
+
+        // Hoist category context out of each item (saves bytes; agent already knows it filtered by subcat).
+        const ctxOut: Record<string, string> | undefined = list[0]
+          ? {
+              top_category: list[0].secondSortName ?? "",
+              sub_category: list[0].firstSortName ?? list[0].componentTypeEn ?? "",
+            }
+          : undefined;
+
+        const result: Record<string, unknown> = {
           total: data.componentPageInfo.total,
           page: data.componentPageInfo.pageNum,
           page_size: data.componentPageInfo.pageSize,
           pages: data.componentPageInfo.pages,
-          has_next: data.componentPageInfo.hasNextPage,
-          sort_by: input.sort_by,
-          applied: {
+          sort: input.sort_by,
+          items,
+        };
+        if (ctxOut && (ctxOut.top_category || ctxOut.sub_category)) result.context = ctxOut;
+        if (input.verbose) {
+          result.applied = {
             keyword: input.keyword || null,
             subcategory_id: input.subcategory_id ?? null,
             attribute_filters: input.attribute_filters,
@@ -491,11 +520,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             library_type: input.library_type,
             in_stock_only: input.in_stock_only,
             min_stock: input.min_stock ?? null,
-          },
-          items,
-          query_echo: data.queryString ?? input.keyword,
-        };
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+          };
+        }
+        return { content: [jsonText(result)] };
       }
 
       case "get_part_details": {
@@ -514,7 +541,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             content: [{ type: "text", text: `No part found for LCSC code '${lcsc_code}'.` }],
           };
         }
-        return { content: [{ type: "text", text: JSON.stringify(detailItem(item), null, 2) }] };
+        return { content: [jsonText(fullItem(item))] };
       }
 
       case "refresh_category_cache": {
