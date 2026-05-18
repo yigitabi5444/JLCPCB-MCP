@@ -1,0 +1,464 @@
+#!/usr/bin/env node
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+
+import { JLCPCBClient, MAX_PAGE_SIZE } from "./client.js";
+import type { ComponentAttributeFilter, ComponentItem, ProductTypeAgg, SearchBody } from "./types.js";
+
+const client = new JLCPCBClient();
+
+// One-time cached category tree (top-level + subAggs). Refreshes on demand.
+let categoryTreeCache: ProductTypeAgg[] | null = null;
+let categoryTreePromise: Promise<ProductTypeAgg[]> | null = null;
+
+async function getCategoryTree(force = false): Promise<ProductTypeAgg[]> {
+  if (categoryTreeCache && !force) return categoryTreeCache;
+  if (!categoryTreePromise || force) {
+    categoryTreePromise = (async () => {
+      const data = await client.filterAttrs({ catalogLevel: 1, nowCondition: "" });
+      categoryTreeCache = data.productTypeAggs ?? [];
+      return categoryTreeCache;
+    })();
+  }
+  return categoryTreePromise;
+}
+
+function findSubcategory(tree: ProductTypeAgg[], subcategoryId: number): { top: ProductTypeAgg; sub: ProductTypeAgg } | null {
+  for (const top of tree) {
+    for (const sub of top.subAggs ?? []) {
+      if (Number(sub.key) === subcategoryId) return { top, sub };
+    }
+  }
+  return null;
+}
+
+function findTopCategory(tree: ProductTypeAgg[], topCategoryIdOrName: number | string): ProductTypeAgg | null {
+  const s = String(topCategoryIdOrName);
+  for (const top of tree) {
+    if (top.key === s || top.name === s) return top;
+  }
+  return null;
+}
+
+// ---------- input schemas ----------
+
+const LibraryTypeEnum = z.enum(["basic", "extended", "any"]).default("any");
+const SortByEnum = z.enum(["relevance", "stock"]).default("relevance");
+
+const ListTopCategoriesInput = z.object({});
+
+const ListSubcategoriesInput = z.object({
+  top_category: z
+    .string()
+    .describe(
+      "Top-level category — either its numeric id (as a string, e.g. '5') or its exact display name (e.g. 'Transistors/Thyristors'). Get values from list_top_categories.",
+    ),
+});
+
+const ListFiltersInput = z.object({
+  subcategory_id: z
+    .number()
+    .int()
+    .describe("Subcategory numeric id (e.g. 2954 = MOSFETs). Get from list_subcategories."),
+  in_stock_only: z.boolean().default(false),
+});
+
+const SearchInput = z.object({
+  subcategory_id: z
+    .number()
+    .int()
+    .optional()
+    .describe("Subcategory id (e.g. 2954 = MOSFETs). Required when you pass attribute_filters."),
+  top_category_id: z
+    .number()
+    .int()
+    .optional()
+    .describe("Top-level category id (e.g. 5 = Transistors/Thyristors). Inferred from subcategory_id if not provided."),
+  keyword: z.string().default("").describe("Free-text. Matches MPN, description, and attribute values."),
+  library_type: LibraryTypeEnum,
+  manufacturers: z.array(z.string()).default([]).describe("Exact brand names (use list_filters_for_subcategory)."),
+  packages: z.array(z.string()).default([]).describe("Exact package names (e.g. '0402', 'TO-247AC')."),
+  attribute_filters: z
+    .record(z.string(), z.array(z.string()))
+    .default({})
+    .describe(
+      "Per-attribute filters as { attribute_name: [value, ...] }. Names/values must match what list_filters_for_subcategory returns. Multiple attributes are AND-ed; multiple values per attribute are OR-ed. Applied natively by the JLCPCB API.",
+    ),
+  in_stock_only: z.boolean().default(false),
+  min_stock: z.number().int().min(0).optional().describe("Minimum stock count (API-level filter)."),
+  sort_by: SortByEnum.describe("'relevance' (JLCPCB default) or 'stock' (most-stocked first, sorted natively by the API)."),
+  page: z.number().int().min(1).default(1),
+  page_size: z.number().int().min(1).max(MAX_PAGE_SIZE).default(20),
+});
+
+const GetPartInput = z.object({
+  lcsc_code: z.string().describe("LCSC C-code, e.g. 'C25804'."),
+});
+
+const RefreshCacheInput = z.object({});
+
+// ---------- helpers ----------
+
+function mapLibraryType(v: z.infer<typeof LibraryTypeEnum>): { componentLibraryType?: "base" | "expand"; componentLibTypes: string[] } {
+  if (v === "basic") return { componentLibraryType: "base", componentLibTypes: ["base"] };
+  if (v === "extended") return { componentLibraryType: "expand", componentLibTypes: [] };
+  return { componentLibTypes: [] };
+}
+
+function summarizeItem(it: ComponentItem) {
+  return {
+    lcsc: it.componentCode,
+    mpn: it.componentModelEn,
+    manufacturer: it.componentBrandEn,
+    top_category: it.secondSortName ?? null,
+    sub_category: it.firstSortName ?? it.componentTypeEn ?? null,
+    package: it.componentSpecificationEn,
+    stock: it.stockCount,
+    library_type:
+      it.componentLibraryType === "base" ? "basic" : it.componentLibraryType === "expand" ? "extended" : it.componentLibraryType,
+    price_breaks: (it.componentPrices ?? []).map((p) => ({
+      qty_min: p.startNumber,
+      qty_max: p.endNumber === -1 ? null : p.endNumber,
+      unit_price_usd: p.productPrice,
+    })),
+    datasheet_url: it.dataManualOfficialLink || it.dataManualUrl || null,
+    image_url: it.componentImageUrl ?? null,
+    description: it.describe ?? null,
+    attributes: (it.attributes ?? []).reduce<Record<string, string>>((acc, a) => {
+      if (a && a.attribute_name_en) acc[a.attribute_name_en] = a.attribute_value_name;
+      return acc;
+    }, {}),
+  };
+}
+
+function detailItem(it: ComponentItem) {
+  return {
+    ...summarizeItem(it),
+    image_list: it.imageList ?? [],
+    component_id: it.componentId,
+  };
+}
+
+function flatNodes(nodes: ProductTypeAgg[] | null | undefined): { id: number; name: string; count: number }[] {
+  return (nodes ?? []).map((n) => ({ id: Number(n.key), name: n.name, count: n.docCount }));
+}
+
+/** "Transistors/Thyristors" → "Transistors_Thyristors". JLCPCB uses this in firstSortNameNew. */
+function slugifyFirstSortName(name: string): string {
+  return name.replace(/\//g, "_");
+}
+
+function attrFiltersToList(filters: Record<string, string[]>): ComponentAttributeFilter[] {
+  const entries = Object.entries(filters).filter(([, vs]) => vs.length > 0);
+  return entries.map(([k, vs]) => ({ [k]: vs }));
+}
+
+// ---------- MCP server ----------
+
+const server = new Server(
+  { name: "jlcpcb-mcp", version: "0.3.0" },
+  { capabilities: { tools: {} } },
+);
+
+const TOOLS = [
+  {
+    name: "list_top_categories",
+    description:
+      "List all top-level JLCPCB part categories with ids and part counts. Start here. No arguments.",
+    inputSchema: zodToJsonSchema(ListTopCategoriesInput),
+  },
+  {
+    name: "list_subcategories",
+    description:
+      "List sub-categories under one top-level category, with ids and part counts. Pass the subcategory id to list_filters_for_subcategory and search_parts.",
+    inputSchema: zodToJsonSchema(ListSubcategoriesInput),
+  },
+  {
+    name: "list_filters_for_subcategory",
+    description:
+      "Discover filters that apply to a sub-category: parametric attributes (with distinct values + counts), manufacturers, packages. Stock filter is always available via in_stock_only. Returned values can be passed verbatim to search_parts.",
+    inputSchema: zodToJsonSchema(ListFiltersInput),
+  },
+  {
+    name: "search_parts",
+    description:
+      "Search JLCPCB parts. Pass subcategory_id for parametric filtering. attribute_filters takes { attribute_name: [values] } and is applied natively by the API. sort_by='stock' sorts natively. Pagination via page/page_size (max 50).",
+    inputSchema: zodToJsonSchema(SearchInput),
+  },
+  {
+    name: "get_part_details",
+    description:
+      "Get full details for one part by its LCSC C-code (e.g. 'C25804'). Includes price tiers, attributes, datasheet URL.",
+    inputSchema: zodToJsonSchema(GetPartInput),
+  },
+  {
+    name: "refresh_category_cache",
+    description: "Force a refresh of the in-memory category tree cache. No arguments.",
+    inputSchema: zodToJsonSchema(RefreshCacheInput),
+  },
+] as const;
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const { name, arguments: rawArgs } = req.params;
+
+  try {
+    switch (name) {
+      case "list_top_categories": {
+        const tree = await getCategoryTree();
+        const cats = flatNodes(tree).sort((a, b) => a.name.localeCompare(b.name));
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ total_categories: cats.length, categories: cats }, null, 2) },
+          ],
+        };
+      }
+
+      case "list_subcategories": {
+        const { top_category } = ListSubcategoriesInput.parse(rawArgs ?? {});
+        const tree = await getCategoryTree();
+        const top = findTopCategory(tree, top_category);
+        if (!top) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Top-level category '${top_category}' not found. Call list_top_categories first.` }],
+          };
+        }
+        const subs = flatNodes(top.subAggs).sort((a, b) => a.name.localeCompare(b.name));
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ top_category: { id: Number(top.key), name: top.name, count: top.docCount }, subcategories: subs }, null, 2) },
+          ],
+        };
+      }
+
+      case "list_filters_for_subcategory": {
+        const input = ListFiltersInput.parse(rawArgs ?? {});
+        const tree = await getCategoryTree();
+        const ctx = findSubcategory(tree, input.subcategory_id);
+        if (!ctx) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `subcategory_id ${input.subcategory_id} not found in category tree.` }],
+          };
+        }
+        // Use filterComponentAttribute to ask the API for the parametric facets it would show.
+        const data = await client.filterAttrs({
+          componentTypeIdList: [input.subcategory_id],
+          productTypeIdList: [Number(ctx.top.key)],
+          presaleTypes: input.in_stock_only ? ["stock"] : [],
+          catalogLevel: 2,
+          nowCondition: "stockType",
+        });
+
+        // MOSFET-type parametric facets land in `paramList`. parentParamList / parentParamRangeList
+        // are used in other contexts (e.g. without a subcategory). Merge all three, dedup by name.
+        const seen = new Set<string>();
+        const collected: { name: string; values: { value: string; count: number }[] }[] = [];
+        for (const src of [data.paramList ?? [], data.parentParamList ?? [], data.parentParamRangeList ?? []]) {
+          for (const p of src) {
+            if (!p?.name || seen.has(p.name)) continue;
+            const values = (p.subAggs ?? [])
+              .map((s) => ({ value: s.name, count: s.docCount }))
+              .filter((v) => v.value && v.value !== "-" && !v.value.includes("、-"));
+            if (!values.length) continue;
+            seen.add(p.name);
+            collected.push({ name: p.name, values });
+          }
+        }
+        // Sort by total coverage (sum of value counts) descending so the most-useful attrs come first.
+        collected.sort((a, b) => b.values.reduce((s, v) => s + v.count, 0) - a.values.reduce((s, v) => s + v.count, 0));
+        const attributes = collected;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  top_category: { id: Number(ctx.top.key), name: ctx.top.name },
+                  subcategory: { id: Number(ctx.sub.key), name: ctx.sub.name, count: ctx.sub.docCount },
+                  total_in_subcategory: data.total,
+                  always_available_filters: { in_stock_only: true, library_type: ["basic", "extended"], sort_by: ["relevance", "stock"], min_stock: "integer >= 0" },
+                  manufacturers: data.componentBrandList ?? [],
+                  packages: data.componentSpecificationList ?? [],
+                  attributes,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "search_parts": {
+        const input = SearchInput.parse(rawArgs ?? {});
+        const body: SearchBody = {
+          currentPage: input.page,
+          pageSize: input.page_size,
+          keyword: input.keyword || null,
+          searchSource: "search",
+          searchType: 3,
+          paramList: [],
+          firstSortNameList: [],
+        };
+
+        // Resolve category context if subcategory_id given.
+        if (input.subcategory_id != null) {
+          const tree = await getCategoryTree();
+          const ctx = findSubcategory(tree, input.subcategory_id);
+          if (!ctx) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `subcategory_id ${input.subcategory_id} not found. Call list_top_categories / list_subcategories first.` }],
+            };
+          }
+          body.secondSortId = Number(ctx.sub.key);
+          body.secondSortName = ctx.sub.name;
+          body.firstSortId = input.top_category_id ?? Number(ctx.top.key);
+          body.firstSortName = ctx.top.name;
+          body.firstSortNameNew = slugifyFirstSortName(ctx.top.name);
+        } else if (input.top_category_id != null) {
+          const tree = await getCategoryTree();
+          const top = findTopCategory(tree, input.top_category_id);
+          if (top) {
+            body.firstSortId = Number(top.key);
+            body.firstSortName = top.name;
+            body.firstSortNameNew = slugifyFirstSortName(top.name);
+          } else {
+            body.firstSortId = input.top_category_id;
+          }
+        }
+
+        const lt = mapLibraryType(input.library_type);
+        if (lt.componentLibraryType) body.componentLibraryType = lt.componentLibraryType;
+        body.componentLibTypes = lt.componentLibTypes;
+
+        if (input.manufacturers.length) body.componentBrandList = input.manufacturers;
+        if (input.packages.length) body.componentSpecificationList = input.packages;
+
+        const attrList = attrFiltersToList(input.attribute_filters);
+        if (attrList.length) body.componentAttributeList = attrList;
+
+        if (input.in_stock_only) body.presaleTypes = ["stock"];
+        if (input.min_stock != null) body.startStockNumber = input.min_stock;
+
+        if (input.sort_by === "stock") {
+          body.sortMode = "STOCK_SORT";
+          body.sortASC = "DESC";
+        }
+
+        const data = await client.search(body);
+        const items = (data.componentPageInfo.list ?? []).map(summarizeItem);
+        const result = {
+          total: data.componentPageInfo.total,
+          page: data.componentPageInfo.pageNum,
+          page_size: data.componentPageInfo.pageSize,
+          pages: data.componentPageInfo.pages,
+          has_next: data.componentPageInfo.hasNextPage,
+          sort_by: input.sort_by,
+          applied: {
+            keyword: input.keyword || null,
+            subcategory_id: input.subcategory_id ?? null,
+            attribute_filters: input.attribute_filters,
+            manufacturers: input.manufacturers,
+            packages: input.packages,
+            library_type: input.library_type,
+            in_stock_only: input.in_stock_only,
+            min_stock: input.min_stock ?? null,
+          },
+          items,
+          query_echo: data.queryString ?? input.keyword,
+        };
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "get_part_details": {
+        const { lcsc_code } = GetPartInput.parse(rawArgs ?? {});
+        const data = await client.search({
+          currentPage: 1,
+          pageSize: 1,
+          keyword: lcsc_code,
+          searchSource: "search",
+          searchType: 3,
+        });
+        const item = data.componentPageInfo.list?.[0];
+        if (!item) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `No part found for LCSC code '${lcsc_code}'.` }],
+          };
+        }
+        return { content: [{ type: "text", text: JSON.stringify(detailItem(item), null, 2) }] };
+      }
+
+      case "refresh_category_cache": {
+        const tree = await getCategoryTree(true);
+        return { content: [{ type: "text", text: `Refreshed. ${tree.length} top-level categories loaded.` }] };
+      }
+
+      default:
+        return { isError: true, content: [{ type: "text", text: `Unknown tool: ${name}` }] };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { isError: true, content: [{ type: "text", text: msg }] };
+  }
+});
+
+// Minimal zod -> JSON Schema. Only the subset that MCP clients consume.
+function zodToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
+  const out: Record<string, unknown> = { type: "object", properties: {}, required: [] };
+  const props = out.properties as Record<string, unknown>;
+  const required = out.required as string[];
+
+  if (!(schema instanceof z.ZodObject)) {
+    return { type: "object" };
+  }
+  const shape = schema.shape as Record<string, z.ZodTypeAny>;
+
+  for (const [key, field] of Object.entries(shape)) {
+    let f = field;
+    let optional = false;
+    let description: string | undefined;
+
+    if (f._def?.description) description = f._def.description;
+    while (f instanceof z.ZodOptional || f instanceof z.ZodDefault) {
+      optional = true;
+      f = (f._def as { innerType: z.ZodTypeAny }).innerType;
+      if (!description && f._def?.description) description = f._def.description;
+    }
+
+    let entry: Record<string, unknown> = {};
+    if (f instanceof z.ZodString) entry = { type: "string" };
+    else if (f instanceof z.ZodNumber) entry = { type: "number" };
+    else if (f instanceof z.ZodBoolean) entry = { type: "boolean" };
+    else if (f instanceof z.ZodArray) entry = { type: "array", items: { type: "string" } };
+    else if (f instanceof z.ZodEnum) entry = { type: "string", enum: [...f.options] };
+    else if (f instanceof z.ZodRecord)
+      entry = { type: "object", additionalProperties: { type: "array", items: { type: "string" } } };
+    else entry = {};
+
+    if (description) entry.description = description;
+
+    props[key] = entry;
+    if (!optional) required.push(key);
+  }
+  if (!required.length) delete (out as { required?: unknown }).required;
+  return out;
+}
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("jlcpcb-mcp ready");
+}
+
+main().catch((err) => {
+  console.error("Fatal:", err);
+  process.exit(1);
+});
