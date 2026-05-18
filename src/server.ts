@@ -63,6 +63,38 @@ const ListFiltersInput = z.object({
     .int()
     .describe("Subcategory numeric id (e.g. 2954 = MOSFETs). Get from list_subcategories."),
   in_stock_only: z.boolean().default(false),
+  values_per_attribute: z
+    .number()
+    .int()
+    .min(5)
+    .max(200)
+    .default(20)
+    .describe(
+      "Max distinct values to return per attribute (most-common first). Defaults to 20. Use get_attribute_values to enumerate all values for a specific attribute when needed.",
+    ),
+  min_value_count: z
+    .number()
+    .int()
+    .min(1)
+    .default(2)
+    .describe(
+      "Drop attribute values that appear in fewer than this many parts (kills long-tail noise like 'RDS(on)=1.23nΩ@10V'). Defaults to 2. Set to 1 to include singletons.",
+    ),
+  include_packages: z.boolean().default(false).describe("Include the full package list (often 1000+ entries). Default false."),
+  include_manufacturers: z.boolean().default(false).describe("Include the full manufacturer list (often 200+ entries). Default false."),
+});
+
+const GetAttributeValuesInput = z.object({
+  subcategory_id: z
+    .number()
+    .int()
+    .describe("Subcategory numeric id (e.g. 2954 = MOSFETs)."),
+  attribute_name: z
+    .string()
+    .describe("Exact attribute name as returned by list_filters_for_subcategory, e.g. 'Drain to Source Voltage'."),
+  in_stock_only: z.boolean().default(false),
+  limit: z.number().int().min(1).max(500).default(100).describe("Max values to return, most-common first."),
+  min_value_count: z.number().int().min(1).default(1),
 });
 
 const SearchInput = z.object({
@@ -158,7 +190,7 @@ function attrFiltersToList(filters: Record<string, string[]>): ComponentAttribut
 // ---------- MCP server ----------
 
 const server = new Server(
-  { name: "jlcpcb-mcp", version: "0.3.0" },
+  { name: "jlcpcb-mcp", version: "0.4.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -178,8 +210,14 @@ const TOOLS = [
   {
     name: "list_filters_for_subcategory",
     description:
-      "Discover filters that apply to a sub-category: parametric attributes (with distinct values + counts), manufacturers, packages. Stock filter is always available via in_stock_only. Returned values can be passed verbatim to search_parts.",
+      "Discover filters that apply to a sub-category: parametric attribute names with their MOST-COMMON values (capped, low-count noise stripped), plus counts. Stock filter is always available via in_stock_only. For full enumeration of one attribute's values, call get_attribute_values. The returned values can be passed verbatim to search_parts.attribute_filters.",
     inputSchema: zodToJsonSchema(ListFiltersInput),
+  },
+  {
+    name: "get_attribute_values",
+    description:
+      "Enumerate ALL distinct values (or the top-N most common) for ONE attribute within a sub-category. Use when list_filters_for_subcategory's per-attribute cap hid values you need.",
+    inputSchema: zodToJsonSchema(GetAttributeValuesInput),
   },
   {
     name: "search_parts",
@@ -245,7 +283,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             content: [{ type: "text", text: `subcategory_id ${input.subcategory_id} not found in category tree.` }],
           };
         }
-        // Use filterComponentAttribute to ask the API for the parametric facets it would show.
         const data = await client.filterAttrs({
           componentTypeIdList: [input.subcategory_id],
           productTypeIdList: [Number(ctx.top.key)],
@@ -255,23 +292,31 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         });
 
         // MOSFET-type parametric facets land in `paramList`. parentParamList / parentParamRangeList
-        // are used in other contexts (e.g. without a subcategory). Merge all three, dedup by name.
+        // are used in other contexts (no subcategory). Merge all three, dedup by name.
         const seen = new Set<string>();
-        const collected: { name: string; values: { value: string; count: number }[] }[] = [];
+        const collected: { name: string; total_values: number; total_parts: number; values: { value: string; count: number }[] }[] = [];
         for (const src of [data.paramList ?? [], data.parentParamList ?? [], data.parentParamRangeList ?? []]) {
           for (const p of src) {
             if (!p?.name || seen.has(p.name)) continue;
-            const values = (p.subAggs ?? [])
+            const raw = (p.subAggs ?? [])
               .map((s) => ({ value: s.name, count: s.docCount }))
               .filter((v) => v.value && v.value !== "-" && !v.value.includes("、-"));
-            if (!values.length) continue;
+            if (!raw.length) continue;
+            const above = raw.filter((v) => v.count >= input.min_value_count);
+            const useable = above.length ? above : raw; // if everything is rare, still show the rare ones
+            useable.sort((a, b) => b.count - a.count);
+            const totalParts = useable.reduce((s, v) => s + v.count, 0);
+            const capped = useable.slice(0, input.values_per_attribute);
             seen.add(p.name);
-            collected.push({ name: p.name, values });
+            collected.push({ name: p.name, total_values: useable.length, total_parts: totalParts, values: capped });
           }
         }
-        // Sort by total coverage (sum of value counts) descending so the most-useful attrs come first.
-        collected.sort((a, b) => b.values.reduce((s, v) => s + v.count, 0) - a.values.reduce((s, v) => s + v.count, 0));
-        const attributes = collected;
+        // Most-useful attributes first (highest total parts covered).
+        collected.sort((a, b) => b.total_parts - a.total_parts);
+
+        // Cap manufacturer/package lists too — they can have 200+/1000+ entries each.
+        const allMfrs = data.componentBrandList ?? [];
+        const allPkgs = data.componentSpecificationList ?? [];
 
         return {
           content: [
@@ -282,10 +327,86 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
                   top_category: { id: Number(ctx.top.key), name: ctx.top.name },
                   subcategory: { id: Number(ctx.sub.key), name: ctx.sub.name, count: ctx.sub.docCount },
                   total_in_subcategory: data.total,
-                  always_available_filters: { in_stock_only: true, library_type: ["basic", "extended"], sort_by: ["relevance", "stock"], min_stock: "integer >= 0" },
-                  manufacturers: data.componentBrandList ?? [],
-                  packages: data.componentSpecificationList ?? [],
-                  attributes,
+                  always_available_filters: {
+                    in_stock_only: true,
+                    library_type: ["basic", "extended"],
+                    sort_by: ["relevance", "stock"],
+                    min_stock: "integer >= 0",
+                  },
+                  hints: {
+                    values_per_attribute_cap: input.values_per_attribute,
+                    min_value_count: input.min_value_count,
+                    note: "Use get_attribute_values for an attribute's full value list. If 'total_values' on an attribute exceeds the cap, some values are hidden.",
+                  },
+                  manufacturers: {
+                    total: allMfrs.length,
+                    sample: input.include_manufacturers ? allMfrs : allMfrs.slice(0, 30),
+                  },
+                  packages: {
+                    total: allPkgs.length,
+                    sample: input.include_packages ? allPkgs : allPkgs.slice(0, 30),
+                  },
+                  attributes: collected,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "get_attribute_values": {
+        const input = GetAttributeValuesInput.parse(rawArgs ?? {});
+        const tree = await getCategoryTree();
+        const ctx = findSubcategory(tree, input.subcategory_id);
+        if (!ctx) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `subcategory_id ${input.subcategory_id} not found in category tree.` }],
+          };
+        }
+        const data = await client.filterAttrs({
+          componentTypeIdList: [input.subcategory_id],
+          productTypeIdList: [Number(ctx.top.key)],
+          presaleTypes: input.in_stock_only ? ["stock"] : [],
+          catalogLevel: 2,
+          nowCondition: "stockType",
+        });
+        const wanted = input.attribute_name.toLowerCase();
+        const pools = [data.paramList ?? [], data.parentParamList ?? [], data.parentParamRangeList ?? []];
+        let hit: { name: string; subAggs?: { name: string; docCount: number }[] | null } | null = null;
+        for (const pool of pools) {
+          const found = pool.find((p) => p?.name?.toLowerCase() === wanted);
+          if (found) {
+            hit = found;
+            break;
+          }
+        }
+        if (!hit) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Attribute '${input.attribute_name}' not found for this subcategory. Call list_filters_for_subcategory to see attribute names.` }],
+          };
+        }
+        const raw = (hit.subAggs ?? [])
+          .map((s) => ({ value: s.name, count: s.docCount }))
+          .filter((v) => v.value && v.value !== "-" && !v.value.includes("、-"));
+        const filtered = raw.filter((v) => v.count >= input.min_value_count).sort((a, b) => b.count - a.count);
+        const total_values = filtered.length;
+        const values = filtered.slice(0, input.limit);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  subcategory: { id: Number(ctx.sub.key), name: ctx.sub.name },
+                  attribute: hit.name,
+                  total_values,
+                  returned: values.length,
+                  truncated: total_values > values.length,
+                  values,
                 },
                 null,
                 2,
